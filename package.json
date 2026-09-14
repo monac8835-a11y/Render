@@ -1,0 +1,16 @@
+{
+  "name": "friend-mode-signaling",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal ephemeral WebRTC signaling relay for Imposter AI Bot Friend Mode. Relays SDP/ICE only - never touches game data or API keys.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
