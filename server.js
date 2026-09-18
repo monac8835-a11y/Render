@@ -42,6 +42,18 @@ const MAX_ROOMS = 2000;
 /** @type {Map<string, Room>} */
 const rooms = new Map();
 
+// --- Friend-invite / presence addition -------------------------------
+// These are used ONLY for "invite a friend from my list without typing
+// a code". They sit alongside the existing room-code protocol above and
+// do not change how host-create / friend-join / signal / leave work.
+
+// Map<myId, WebSocket> - who is currently reachable for a direct invite.
+const registeredUsers = new Map();
+
+// Map<fromId, { toId, toWs, hostChoice }> - invites waiting on a response.
+const pendingInvites = new Map();
+// -----------------------------------------------------------------------
+
 function generateRoomCode() {
   let code;
   do {
@@ -125,7 +137,12 @@ wss.on('connection', (ws) => {
           send(ws, { type: 'error', reason: 'SERVER_BUSY' });
           return;
         }
-        const code = generateRoomCode();
+        // Normally we mint a brand new code. But if this host-create is
+        // completing an accepted friend-invite, `msg.code` carries the
+        // code that was already reserved for both sides in
+        // 'invite-response' below, so we reuse it instead of generating
+        // a second, different one.
+        const code = msg.code && !rooms.has(msg.code) ? msg.code : generateRoomCode();
         rooms.set(code, { host: ws, friend: null, createdAt: Date.now() });
         ws.roomCode = code;
         ws.role = 'host';
@@ -186,6 +203,68 @@ wss.on('connection', (ws) => {
         break;
       }
 
+      // --- Friend-invite / presence addition ---------------------------
+      case 'register': {
+        // msg: { type: 'register', myId, displayName }
+        registeredUsers.set(msg.myId, ws);
+        ws._presenceId = msg.myId; // so we can clean up on close
+        ws._presenceName = msg.displayName;
+        send(ws, { type: 'registered' });
+        break;
+      }
+
+      case 'check-online': {
+        // msg: { type: 'check-online', ids: string[] }
+        const ids = Array.isArray(msg.ids) ? msg.ids : [];
+        const onlineIds = ids.filter((id) => registeredUsers.has(id));
+        send(ws, { type: 'online-status', onlineIds });
+        break;
+      }
+
+      case 'invite-friend': {
+        // msg: { type: 'invite-friend', toId, fromId, fromName, hostChoice: 'ME' | 'THEM' }
+        const target = registeredUsers.get(msg.toId);
+        if (!target || target.readyState !== target.OPEN) {
+          send(ws, { type: 'friend-offline', toId: msg.toId });
+          break;
+        }
+        // Remember this pending invite so the eventual 'invite-response'
+        // knows who to reserve a room code for and who becomes host.
+        pendingInvites.set(msg.fromId, {
+          toId: msg.toId,
+          toWs: target,
+          hostChoice: msg.hostChoice,
+        });
+        send(target, { type: 'friend-invite', fromId: msg.fromId, fromName: msg.fromName });
+        break;
+      }
+
+      case 'invite-response': {
+        // msg: { type: 'invite-response', toId, accept }  (toId = original inviter's id)
+        const pending = pendingInvites.get(msg.toId);
+        pendingInvites.delete(msg.toId);
+        if (!pending) break;
+        const inviterWs = registeredUsers.get(msg.toId);
+        if (!msg.accept) {
+          send(inviterWs, { type: 'invite-declined' });
+          break;
+        }
+        if (rooms.size >= MAX_ROOMS) {
+          send(inviterWs, { type: 'error', reason: 'SERVER_BUSY' });
+          send(pending.toWs, { type: 'error', reason: 'SERVER_BUSY' });
+          break;
+        }
+        // Reserve a code using the same generator host-create uses, so
+        // both sides land in an ordinary room exactly like the
+        // type-a-code flow already produces.
+        const code = generateRoomCode();
+        const inviterIsHost = pending.hostChoice === 'ME';
+        send(inviterWs, { type: 'invite-accepted', code, youAreHost: inviterIsHost });
+        send(pending.toWs, { type: 'invite-accepted', code, youAreHost: !inviterIsHost });
+        break;
+      }
+      // -------------------------------------------------------------------
+
       default:
         send(ws, { type: 'error', reason: 'UNKNOWN_TYPE' });
     }
@@ -198,6 +277,11 @@ wss.on('connection', (ws) => {
         send(otherPeer(room, ws), { type: 'peer-left', reason: 'disconnected' });
         closeRoom(ws.roomCode, 'disconnected');
       }
+    }
+    // Friend-invite / presence cleanup - same addition as above.
+    if (ws._presenceId) {
+      registeredUsers.delete(ws._presenceId);
+      pendingInvites.delete(ws._presenceId);
     }
   });
 });
